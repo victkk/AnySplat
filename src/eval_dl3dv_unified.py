@@ -21,10 +21,10 @@ from einops import rearrange
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
-from model.model.anysplat import AnySplat
-from model.encoder.vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from dataset.dataset_dl3dv import DatasetDL3DV, DatasetDl3dvCfg
+from src.evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
+from src.model.model.anysplat import AnySplat
+from src.model.encoder.vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from src.utils.image import process_image
 from misc.image_io import save_image
 
 
@@ -184,7 +184,6 @@ def load_scene_from_dataset(
     Returns:
         context_images, target_images, metadata
     """
-    from utils.image import process_image
     from PIL import Image
 
     scene_path = data_root / "test" / scene_name
