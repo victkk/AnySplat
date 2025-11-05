@@ -55,13 +55,27 @@ def create_comparison_image(
     rendered_np = (rendered.detach().cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
     gt_np = (gt.detach().cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
 
+    # 获取两张图像的尺寸（可能不同）
+    h_rendered, w_rendered = rendered_np.shape[:2]
+    h_gt, w_gt = gt_np.shape[:2]
+
+    # 使用最大尺寸
+    h = max(h_rendered, h_gt)
+    w = max(w_rendered, w_gt)
+
     # 创建并排图像
-    h, w = rendered_np.shape[:2]
     comparison = np.zeros((h + 60, w * 2 + 10, 3), dtype=np.uint8)
 
-    # 放置图像
-    comparison[30:30+h, 5:5+w] = rendered_np
-    comparison[30:30+h, 15+w:15+w+w] = gt_np
+    # 放置图像（居中对齐）
+    y_offset_rendered = (h - h_rendered) // 2
+    x_offset_rendered = (w - w_rendered) // 2
+    comparison[30+y_offset_rendered:30+y_offset_rendered+h_rendered,
+               5+x_offset_rendered:5+x_offset_rendered+w_rendered] = rendered_np
+
+    y_offset_gt = (h - h_gt) // 2
+    x_offset_gt = (w - w_gt) // 2
+    comparison[30+y_offset_gt:30+y_offset_gt+h_gt,
+               15+w+x_offset_gt:15+w+x_offset_gt+w_gt] = gt_np
 
     # 转换为 PIL Image 以添加文字
     comparison_pil = Image.fromarray(comparison)
@@ -100,6 +114,16 @@ def create_error_map(rendered: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     Returns:
         error_map: 误差热图 [3, H, W]
     """
+    # 如果尺寸不匹配，将 rendered 调整到与 gt 相同的尺寸
+    if rendered.shape != gt.shape:
+        import torch.nn.functional as F
+        rendered = F.interpolate(
+            rendered.unsqueeze(0),
+            size=(gt.shape[1], gt.shape[2]),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0)
+
     # 计算 L1 误差
     error = torch.abs(rendered - gt).mean(dim=0)  # [H, W]
 
