@@ -25,7 +25,157 @@ from src.evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
 from src.model.model.anysplat import AnySplat
 from src.model.encoder.vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from src.utils.image import process_image
-from misc.image_io import save_image
+from src.misc.image_io import save_image
+
+import cv2
+from PIL import Image, ImageDraw, ImageFont
+
+
+def create_comparison_image(
+    rendered: torch.Tensor,
+    gt: torch.Tensor,
+    psnr: float,
+    ssim: float,
+    lpips: float,
+    idx: int
+) -> torch.Tensor:
+    """
+    创建并排对比图，带指标标注
+
+    Args:
+        rendered: 渲染图像 [3, H, W]
+        gt: ground truth 图像 [3, H, W]
+        psnr, ssim, lpips: 指标值
+        idx: 图像索引
+
+    Returns:
+        comparison: 对比图 [3, H, W*2]
+    """
+    # 转换为 numpy 数组
+    rendered_np = (rendered.detach().cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+    gt_np = (gt.detach().cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+
+    # 创建并排图像
+    h, w = rendered_np.shape[:2]
+    comparison = np.zeros((h + 60, w * 2 + 10, 3), dtype=np.uint8)
+
+    # 放置图像
+    comparison[30:30+h, 5:5+w] = rendered_np
+    comparison[30:30+h, 15+w:15+w+w] = gt_np
+
+    # 转换为 PIL Image 以添加文字
+    comparison_pil = Image.fromarray(comparison)
+    draw = ImageDraw.Draw(comparison_pil)
+
+    # 尝试使用系统字体，如果失败则使用默认字体
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+    except:
+        font = ImageFont.load_default()
+        font_small = font
+
+    # 添加标题
+    draw.text((5, 5), f"Rendered (Frame {idx})", fill=(255, 255, 255), font=font)
+    draw.text((15+w, 5), "Ground Truth", fill=(255, 255, 255), font=font)
+
+    # 添加指标
+    metrics_text = f"PSNR: {psnr:.2f} dB | SSIM: {ssim:.4f} | LPIPS: {lpips:.4f}"
+    draw.text((5, h + 35), metrics_text, fill=(255, 255, 0), font=font_small)
+
+    # 转换回 tensor
+    comparison_tensor = torch.from_numpy(np.array(comparison_pil)).permute(2, 0, 1).float() / 255.0
+
+    return comparison_tensor
+
+
+def create_error_map(rendered: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """
+    创建误差热图
+
+    Args:
+        rendered: 渲染图像 [3, H, W]
+        gt: ground truth 图像 [3, H, W]
+
+    Returns:
+        error_map: 误差热图 [3, H, W]
+    """
+    # 计算 L1 误差
+    error = torch.abs(rendered - gt).mean(dim=0)  # [H, W]
+
+    # 归一化到 [0, 1]
+    error_norm = (error - error.min()) / (error.max() - error.min() + 1e-8)
+
+    # 应用 colormap (使用 matplotlib)
+    import matplotlib.pyplot as plt
+    error_np = error_norm.cpu().numpy()
+    error_colored = plt.cm.hot(error_np)[:, :, :3]  # [H, W, 3]
+
+    # 转换回 tensor
+    error_tensor = torch.from_numpy(error_colored).permute(2, 0, 1).float()
+
+    return error_tensor
+
+
+def save_scene_images(
+    scene_output_dir: Path,
+    rendered_images: torch.Tensor,
+    gt_images: torch.Tensor,
+    psnr: torch.Tensor,
+    ssim: torch.Tensor,
+    lpips: torch.Tensor,
+    save_comparison: bool = True,
+    save_error_map: bool = True
+):
+    """
+    保存场景的所有图像
+
+    Args:
+        scene_output_dir: 输出目录
+        rendered_images: 渲染图像 [N, 3, H, W]
+        gt_images: GT图像 [N, 3, H, W]
+        psnr, ssim, lpips: 每张图像的指标
+        save_comparison: 是否保存对比图
+        save_error_map: 是否保存误差图
+    """
+    # 创建子目录
+    rendered_dir = scene_output_dir / "rendered"
+    gt_dir = scene_output_dir / "gt"
+    rendered_dir.mkdir(exist_ok=True, parents=True)
+    gt_dir.mkdir(exist_ok=True, parents=True)
+
+    if save_comparison:
+        comparison_dir = scene_output_dir / "comparison"
+        comparison_dir.mkdir(exist_ok=True, parents=True)
+
+    if save_error_map:
+        error_dir = scene_output_dir / "error_map"
+        error_dir.mkdir(exist_ok=True, parents=True)
+
+    # 保存每张图像
+    for idx, (rendered, gt, p, s, l) in enumerate(zip(
+        rendered_images, gt_images, psnr, ssim, lpips
+    )):
+        # 基础图像
+        save_image(rendered, rendered_dir / f"{idx:04d}.jpg")
+        save_image(gt, gt_dir / f"{idx:04d}.jpg")
+
+        # 对比图
+        if save_comparison:
+            comp = create_comparison_image(rendered, gt, p.item(), s.item(), l.item(), idx)
+            save_image(comp, comparison_dir / f"{idx:04d}.jpg")
+
+        # 误差图
+        if save_error_map:
+            error_map = create_error_map(rendered, gt)
+            save_image(error_map, error_dir / f"{idx:04d}.jpg")
+
+    print(f"  保存图像到: {scene_output_dir}")
+    print(f"    - 渲染图: {len(rendered_images)} 张")
+    if save_comparison:
+        print(f"    - 对比图: {len(rendered_images)} 张")
+    if save_error_map:
+        print(f"    - 误差图: {len(rendered_images)} 张")
 
 
 def setup_args():
@@ -61,6 +211,17 @@ def setup_args():
         '--save_images',
         action='store_true',
         help='是否保存渲染图像'
+    )
+    parser.add_argument(
+        '--save_comparison',
+        action='store_true',
+        default=True,
+        help='是否保存并排对比图（rendered vs GT with metrics）'
+    )
+    parser.add_argument(
+        '--save_error_map',
+        action='store_true',
+        help='是否保存误差热图'
     )
     parser.add_argument(
         '--test_single_scene',
@@ -454,10 +615,16 @@ def main():
             # 保存图像
             if args.save_images:
                 scene_output_dir = output_dir / "images" / scene_name
-                scene_output_dir.mkdir(exist_ok=True, parents=True)
-                for idx, (rendered, gt) in enumerate(zip(results['rendered'], results['gt'])):
-                    save_image(rendered, scene_output_dir / f"rendered_{idx:04d}.jpg")
-                    save_image(gt, scene_output_dir / f"gt_{idx:04d}.jpg")
+                save_scene_images(
+                    scene_output_dir,
+                    results['rendered'],
+                    results['gt'],
+                    results['psnr'],
+                    results['ssim'],
+                    results['lpips'],
+                    save_comparison=args.save_comparison,
+                    save_error_map=args.save_error_map
+                )
 
         except Exception as e:
             print(f"ERROR 处理场景 {scene_name}: {e}")
