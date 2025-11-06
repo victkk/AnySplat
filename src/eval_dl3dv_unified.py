@@ -59,23 +59,25 @@ def create_comparison_image(
     h_rendered, w_rendered = rendered_np.shape[:2]
     h_gt, w_gt = gt_np.shape[:2]
 
-    # 使用最大尺寸
+    # 使用最大尺寸作为每个图像区域的大小
     h = max(h_rendered, h_gt)
     w = max(w_rendered, w_gt)
 
-    # 创建并排图像
-    comparison = np.zeros((h + 60, w * 2 + 10, 3), dtype=np.uint8)
+    # 创建并排图像，确保宽度足够放下两张图
+    # 左边区域 5px + w + 5px，右边区域 5px + w + 5px
+    comparison = np.zeros((h + 60, w * 2 + 20, 3), dtype=np.uint8)
 
-    # 放置图像（居中对齐）
+    # 放置左边的 rendered 图像（居中对齐）
     y_offset_rendered = (h - h_rendered) // 2
     x_offset_rendered = (w - w_rendered) // 2
     comparison[30+y_offset_rendered:30+y_offset_rendered+h_rendered,
                5+x_offset_rendered:5+x_offset_rendered+w_rendered] = rendered_np
 
+    # 放置右边的 gt 图像（居中对齐）
     y_offset_gt = (h - h_gt) // 2
     x_offset_gt = (w - w_gt) // 2
     comparison[30+y_offset_gt:30+y_offset_gt+h_gt,
-               15+w+x_offset_gt:15+w+x_offset_gt+w_gt] = gt_np
+               w+15+x_offset_gt:w+15+x_offset_gt+w_gt] = gt_np
 
     # 转换为 PIL Image 以添加文字
     comparison_pil = Image.fromarray(comparison)
@@ -91,7 +93,7 @@ def create_comparison_image(
 
     # 添加标题
     draw.text((5, 5), f"Rendered (Frame {idx})", fill=(255, 255, 255), font=font)
-    draw.text((15+w, 5), "Ground Truth", fill=(255, 255, 255), font=font)
+    draw.text((w+15, 5), "Ground Truth", fill=(255, 255, 255), font=font)
 
     # 添加指标
     metrics_text = f"PSNR: {psnr:.2f} dB | SSIM: {ssim:.4f} | LPIPS: {lpips:.4f}"
