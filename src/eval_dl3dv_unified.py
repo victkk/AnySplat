@@ -204,6 +204,81 @@ def save_scene_images(
         print(f"    - 误差图: {len(rendered_images)} 张")
 
 
+def process_image_with_intrinsics(
+    image_path: Path,
+    intrinsics: np.ndarray,
+    original_size: tuple[int, int],
+    target_size: tuple[int, int] = (252, 448)
+) -> Tuple[torch.Tensor, np.ndarray]:
+    """
+    处理图像并调整相机内参（用于 252×448 分辨率评测）
+
+    从原始 DL3DV images_8 (270×480) center crop 到 252×448，
+    并正确调整归一化的相机内参矩阵。
+
+    Args:
+        image_path: 图像路径
+        intrinsics: 归一化的 3x3 内参矩阵 (已除以原始图像尺寸)
+        original_size: 原始图像尺寸 (height, width)
+        target_size: 目标尺寸 (height, width)，默认 252×448
+
+    Returns:
+        processed_image: 处理后的图像 tensor [3, H, W]，范围 [-1, 1]
+        adjusted_intrinsics: 调整后的归一化内参矩阵 [3, 3]
+    """
+    import torchvision.transforms as transforms
+
+    # 加载图像
+    img = Image.open(image_path)
+    if img.mode == 'RGBA':
+        img = img.convert('RGB')
+
+    h_orig, w_orig = original_size
+    h_target, w_target = target_size
+
+    # 验证尺寸能被 14 整除（patch size 要求）
+    assert h_target % 14 == 0, f"Height {h_target} must be divisible by 14"
+    assert w_target % 14 == 0, f"Width {w_target} must be divisible by 14"
+
+    # 获取实际图像尺寸
+    img_w, img_h = img.size
+
+    # Center crop 计算
+    crop_top = (img_h - h_target) // 2
+    crop_left = (img_w - w_target) // 2
+    crop_bottom = crop_top + h_target
+    crop_right = crop_left + w_target
+
+    # 执行 crop
+    img_cropped = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+    # 转换为 tensor，归一化到 [-1, 1]
+    to_tensor = transforms.ToTensor()
+    img_tensor = to_tensor(img_cropped) * 2.0 - 1.0
+
+    # 调整内参
+    # DL3DV 的内参是归一化的：K[i,j] = pixel_value / image_dimension
+    intrinsics_adjusted = intrinsics.copy()
+
+    # 1. 反归一化到像素空间（基于原始尺寸）
+    fx_pixel = intrinsics[0, 0] * w_orig
+    fy_pixel = intrinsics[1, 1] * h_orig
+    cx_pixel = intrinsics[0, 2] * w_orig
+    cy_pixel = intrinsics[1, 2] * h_orig
+
+    # 2. 调整主点坐标（center crop 的偏移）
+    cx_new = cx_pixel - crop_left
+    cy_new = cy_pixel - crop_top
+
+    # 3. 重新归一化（基于目标尺寸）
+    intrinsics_adjusted[0, 0] = fx_pixel / w_target
+    intrinsics_adjusted[1, 1] = fy_pixel / h_target
+    intrinsics_adjusted[0, 2] = cx_new / w_target
+    intrinsics_adjusted[1, 2] = cy_new / h_target
+
+    return img_tensor, intrinsics_adjusted
+
+
 def setup_args():
     """设置命令行参数"""
     parser = argparse.ArgumentParser(
@@ -362,10 +437,13 @@ def load_scene_from_dataset(
     scene_name: str,
     context_indices: List[int],
     target_indices: List[int],
-    device: torch.device
+    device: torch.device,
+    target_size: tuple[int, int] = (252, 448)
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
     """
     从数据集加载指定场景和 view indices
+
+    支持 252×448 分辨率评测，正确处理图像 resize 和内参调整
 
     Args:
         data_root: 数据集根目录
@@ -373,12 +451,11 @@ def load_scene_from_dataset(
         context_indices: context view 索引列表
         target_indices: target view 索引列表
         device: 设备
+        target_size: 目标图像尺寸 (height, width)，默认 252×448
 
     Returns:
         context_images, target_images, metadata
     """
-    from PIL import Image
-
     scene_path = data_root / "test" / scene_name
 
     # 加载 transforms.json
@@ -387,10 +464,10 @@ def load_scene_from_dataset(
         raise FileNotFoundError(f"未找到 transforms.json: {transforms_path}")
 
     with open(transforms_path, 'r') as f:
-        transforms = json.load(f)
+        transforms_data = json.load(f)
 
-    # 确定图像文件夹（优先使用 images_4，其次 images_8）
-    image_dirs = ["images_4", "images_8", "images"]
+    # 确定图像文件夹（优先使用 images_8，其次 images_4）
+    image_dirs = ["images_8", "images_4", "images"]
     image_dir = None
     for dir_name in image_dirs:
         test_dir = scene_path / dir_name
@@ -403,49 +480,93 @@ def load_scene_from_dataset(
 
     print(f"  使用图像文件夹: {image_dir.name}")
 
-    # 获取图像分辨率
+    # 获取原始图像分辨率
     first_image = next(image_dir.iterdir())
     with Image.open(first_image) as img:
-        image_w, image_h = img.size
-    print(f"  图像分辨率: {image_h}x{image_w}")
+        original_w, original_h = img.size
+    original_size = (original_h, original_w)
 
-    # 加载 context images
+    print(f"  原始分辨率: {original_h}×{original_w}")
+    print(f"  目标分辨率: {target_size[0]}×{target_size[1]}")
+
+    # 从 transforms.json 获取内参 (DL3DV 格式)
+    h_meta = transforms_data.get('h', original_h)
+    w_meta = transforms_data.get('w', original_w)
+    fx = transforms_data['fl_x']
+    fy = transforms_data['fl_y']
+    cx = transforms_data['cx']
+    cy = transforms_data['cy']
+
+    # 构建归一化内参矩阵（与 DL3DV dataset 一致）
+    base_intrinsics = np.eye(3, dtype=np.float32)
+    base_intrinsics[0, 0] = fx / w_meta
+    base_intrinsics[1, 1] = fy / h_meta
+    base_intrinsics[0, 2] = cx / w_meta
+    base_intrinsics[1, 2] = cy / h_meta
+
+    # 加载 context images 和调整内参
     context_images = []
+    context_intrinsics = []
+
     for idx in context_indices:
-        frame_info = transforms['frames'][idx]
-        image_path = scene_path / frame_info['file_path']
-        # 如果路径不存在，尝试从 image_dir 加载
+        frame_info = transforms_data['frames'][idx]
+        image_filename = Path(frame_info['file_path']).name
+        image_path = image_dir / image_filename
+
         if not image_path.exists():
-            filename = Path(frame_info['file_path']).name
-            image_path = image_dir / filename
+            raise FileNotFoundError(f"图像不存在: {image_path}")
 
-        image = process_image(str(image_path))
-        context_images.append(image)
+        # 使用新函数处理图像和内参
+        img_tensor, intrinsics_adjusted = process_image_with_intrinsics(
+            image_path, base_intrinsics, original_size, target_size
+        )
 
-    # 加载 target images
+        context_images.append(img_tensor)
+        context_intrinsics.append(intrinsics_adjusted)
+
+    # 加载 target images 和调整内参
     target_images = []
+    target_intrinsics = []
+
     for idx in target_indices:
-        frame_info = transforms['frames'][idx]
-        image_path = scene_path / frame_info['file_path']
+        frame_info = transforms_data['frames'][idx]
+        image_filename = Path(frame_info['file_path']).name
+        image_path = image_dir / image_filename
+
         if not image_path.exists():
-            filename = Path(frame_info['file_path']).name
-            image_path = image_dir / filename
+            raise FileNotFoundError(f"图像不存在: {image_path}")
 
-        image = process_image(str(image_path))
-        target_images.append(image)
+        img_tensor, intrinsics_adjusted = process_image_with_intrinsics(
+            image_path, base_intrinsics, original_size, target_size
+        )
 
+        target_images.append(img_tensor)
+        target_intrinsics.append(intrinsics_adjusted)
+
+    # 转换为 tensor
     context_images = torch.stack(context_images, dim=0).unsqueeze(0).to(device)
     target_images = torch.stack(target_images, dim=0).unsqueeze(0).to(device)
 
-    # 归一化到 [0, 1]
+    # 归一化到 [0, 1] (AnySplat 需要)
     context_images = (context_images + 1) * 0.5
     target_images = (target_images + 1) * 0.5
 
+    # 转换内参为 tensor
+    context_intrinsics = torch.tensor(
+        np.stack(context_intrinsics, axis=0), dtype=torch.float32, device=device
+    ).unsqueeze(0)
+    target_intrinsics = torch.tensor(
+        np.stack(target_intrinsics, axis=0), dtype=torch.float32, device=device
+    ).unsqueeze(0)
+
     metadata = {
         'scene_name': scene_name,
-        'image_shape': (image_h, image_w),
+        'image_shape': target_size,
+        'original_size': original_size,
         'num_context': len(context_indices),
         'num_target': len(target_indices),
+        'context_intrinsics': context_intrinsics,
+        'target_intrinsics': target_intrinsics,
     }
 
     return context_images, target_images, metadata
@@ -455,15 +576,19 @@ def evaluate_scene(
     model: AnySplat,
     context_images: torch.Tensor,
     target_images: torch.Tensor,
+    metadata: Dict,
     device: torch.device
 ) -> Dict[str, torch.Tensor]:
     """
     对单个场景进行评测
 
+    支持使用从数据集加载的调整后内参进行渲染
+
     Args:
         model: AnySplat 模型
         context_images: context 图像 [1, C, 3, H, W]
         target_images: target 图像 [1, T, 3, H, W]
+        metadata: 包含调整后的内参和图像尺寸信息
         device: 设备
 
     Returns:
@@ -646,13 +771,14 @@ def main():
         target_indices = indices['target']
 
         try:
-            # 加载数据
+            # 加载数据（使用 252×448 分辨率）
             context_images, target_images, metadata = load_scene_from_dataset(
-                data_root, scene_name, context_indices, target_indices, device
+                data_root, scene_name, context_indices, target_indices, device,
+                target_size=(252, 448)
             )
 
-            # 评测
-            results = evaluate_scene(model, context_images, target_images, device)
+            # 评测（传递 metadata）
+            results = evaluate_scene(model, context_images, target_images, metadata, device)
 
             # 保存结果
             scene_metrics = {
