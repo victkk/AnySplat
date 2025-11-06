@@ -9,6 +9,7 @@ import sys
 import json
 import argparse
 import hashlib
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 from tqdm import tqdm
@@ -602,6 +603,11 @@ def evaluate_scene(
     b, num_context, _, h, w = context_images.shape
     num_target = target_images.shape[1]
 
+    # 记录生成 GS 的开始时间
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    gs_start_time = time.time()
+
     # 1. Encoder forward
     with torch.no_grad():
         encoder_output = model.encoder(
@@ -654,7 +660,18 @@ def evaluate_scene(
     )
     pred_target_extrinsic[..., :3, 3] = pred_target_extrinsic[..., :3, 3] * scale_factor
 
-    # 3. Decoder forward
+    # 记录生成 GS 的结束时间
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    gs_end_time = time.time()
+    gs_time = gs_end_time - gs_start_time
+
+    # 记录渲染的开始时间
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    render_start_time = time.time()
+
+    # 3. Decoder forward (渲染)
     with torch.no_grad():
         output = model.decoder.forward(
             gaussians,
@@ -664,6 +681,12 @@ def evaluate_scene(
             torch.ones(1, num_target, device=device) * 100,
             (h, w)
         )
+
+    # 记录渲染的结束时间
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    render_end_time = time.time()
+    render_time = render_end_time - render_start_time
 
     # 4. 获取 Gaussian 基元数量
     # gaussians 通常是一个字典或对象，包含 means, scales, rotations 等
@@ -696,6 +719,9 @@ def evaluate_scene(
         'rendered': rendered_images,
         'gt': gt_images,
         'num_gaussians': num_gaussians,
+        'gs_time': gs_time,  # 生成 GS 的时间（秒）
+        'render_time': render_time,  # 渲染时间（秒）
+        'total_time': gs_time + render_time,  # 总推理时间（秒）
     }
 
 
@@ -753,7 +779,10 @@ def main():
 
     # 评测所有场景
     all_results = {}
-    summary_metrics = {'psnr': [], 'ssim': [], 'lpips': [], 'num_gaussians': []}
+    summary_metrics = {
+        'psnr': [], 'ssim': [], 'lpips': [], 'num_gaussians': [],
+        'gs_time': [], 'render_time': [], 'total_time': []
+    }
 
     print(f"\n开始评测 {len(eval_indices)} 个场景...")
     for scene_hash, indices in tqdm(eval_indices.items(), desc="评测进度"):
@@ -786,6 +815,9 @@ def main():
                 'ssim_mean': results['ssim'].mean().item(),
                 'lpips_mean': results['lpips'].mean().item(),
                 'num_gaussians': results['num_gaussians'],
+                'gs_time': results['gs_time'],
+                'render_time': results['render_time'],
+                'total_time': results['total_time'],
                 'psnr_per_image': results['psnr'].tolist(),
                 'ssim_per_image': results['ssim'].tolist(),
                 'lpips_per_image': results['lpips'].tolist(),
@@ -797,6 +829,9 @@ def main():
             summary_metrics['ssim'].append(results['ssim'].mean().item())
             summary_metrics['lpips'].append(results['lpips'].mean().item())
             summary_metrics['num_gaussians'].append(results['num_gaussians'])
+            summary_metrics['gs_time'].append(results['gs_time'])
+            summary_metrics['render_time'].append(results['render_time'])
+            summary_metrics['total_time'].append(results['total_time'])
 
             # 保存图像
             if args.save_images:
@@ -844,23 +879,51 @@ def main():
             'min': int(np.min(summary_metrics['num_gaussians'])),
             'max': int(np.max(summary_metrics['num_gaussians'])),
         },
+        'gs_time': {
+            'mean': np.mean(summary_metrics['gs_time']),
+            'std': np.std(summary_metrics['gs_time']),
+            'min': np.min(summary_metrics['gs_time']),
+            'max': np.max(summary_metrics['gs_time']),
+        },
+        'render_time': {
+            'mean': np.mean(summary_metrics['render_time']),
+            'std': np.std(summary_metrics['render_time']),
+            'min': np.min(summary_metrics['render_time']),
+            'max': np.max(summary_metrics['render_time']),
+        },
+        'total_time': {
+            'mean': np.mean(summary_metrics['total_time']),
+            'std': np.std(summary_metrics['total_time']),
+            'min': np.min(summary_metrics['total_time']),
+            'max': np.max(summary_metrics['total_time']),
+        },
         'num_scenes': len(summary_metrics['psnr']),
     }
 
     # 打印结果
-    print("\n" + "="*50)
+    print("\n" + "="*70)
     print("评测结果汇总")
-    print("="*50)
+    print("="*70)
     print(f"场景数量: {summary['num_scenes']}")
-    print(f"PSNR:  {summary['psnr']['mean']:.2f} ± {summary['psnr']['std']:.2f} "
+    print(f"\n渲染质量指标:")
+    print(f"  PSNR:  {summary['psnr']['mean']:.2f} ± {summary['psnr']['std']:.2f} dB "
           f"(min: {summary['psnr']['min']:.2f}, max: {summary['psnr']['max']:.2f})")
-    print(f"SSIM:  {summary['ssim']['mean']:.4f} ± {summary['ssim']['std']:.4f} "
+    print(f"  SSIM:  {summary['ssim']['mean']:.4f} ± {summary['ssim']['std']:.4f} "
           f"(min: {summary['ssim']['min']:.4f}, max: {summary['ssim']['max']:.4f})")
-    print(f"LPIPS: {summary['lpips']['mean']:.4f} ± {summary['lpips']['std']:.4f} "
+    print(f"  LPIPS: {summary['lpips']['mean']:.4f} ± {summary['lpips']['std']:.4f} "
           f"(min: {summary['lpips']['min']:.4f}, max: {summary['lpips']['max']:.4f})")
-    print(f"Gaussians: {summary['num_gaussians']['mean']:.0f} ± {summary['num_gaussians']['std']:.0f} "
+    print(f"\n模型统计:")
+    print(f"  Gaussians: {summary['num_gaussians']['mean']:.0f} ± {summary['num_gaussians']['std']:.0f} "
           f"(min: {summary['num_gaussians']['min']}, max: {summary['num_gaussians']['max']})")
-    print("="*50)
+    print(f"\n推理时间 (秒):")
+    print(f"  生成 GS:  {summary['gs_time']['mean']:.4f} ± {summary['gs_time']['std']:.4f} s "
+          f"(min: {summary['gs_time']['min']:.4f}, max: {summary['gs_time']['max']:.4f})")
+    print(f"  渲染:     {summary['render_time']['mean']:.4f} ± {summary['render_time']['std']:.4f} s "
+          f"(min: {summary['render_time']['min']:.4f}, max: {summary['render_time']['max']:.4f})")
+    print(f"  总计:     {summary['total_time']['mean']:.4f} ± {summary['total_time']['std']:.4f} s "
+          f"(min: {summary['total_time']['min']:.4f}, max: {summary['total_time']['max']:.4f})")
+    print(f"\n平均 FPS: {1.0 / summary['total_time']['mean']:.2f} (基于总推理时间)")
+    print("="*70)
 
     # 保存结果
     results_path = output_dir / "results.json"
