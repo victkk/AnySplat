@@ -603,12 +603,12 @@ def evaluate_scene(
     b, num_context, _, h, w = context_images.shape
     num_target = target_images.shape[1]
 
-    # 记录生成 GS 的开始时间
+    # 记录 Encoder forward 的开始时间
     if device.type == 'cuda':
         torch.cuda.synchronize()
-    gs_start_time = time.time()
+    encoder_start_time = time.time()
 
-    # 1. Encoder forward
+    # 1. Encoder forward (生成 Gaussians)
     with torch.no_grad():
         encoder_output = model.encoder(
             context_images,
@@ -617,6 +617,17 @@ def evaluate_scene(
         )
         gaussians = encoder_output.gaussians
         pred_context_pose = encoder_output.pred_context_pose
+
+    # 记录 Encoder forward 的结束时间
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    encoder_end_time = time.time()
+    encoder_time = encoder_end_time - encoder_start_time
+
+    # 记录 Pose prediction 的开始时间
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    pose_start_time = time.time()
 
     # 2. 预测所有 poses (context + target)
     all_images = torch.cat((context_images, target_images), dim=1).to(torch.bfloat16)
@@ -660,11 +671,14 @@ def evaluate_scene(
     )
     pred_target_extrinsic[..., :3, 3] = pred_target_extrinsic[..., :3, 3] * scale_factor
 
-    # 记录生成 GS 的结束时间
+    # 记录 Pose prediction 的结束时间
     if device.type == 'cuda':
         torch.cuda.synchronize()
-    gs_end_time = time.time()
-    gs_time = gs_end_time - gs_start_time
+    pose_end_time = time.time()
+    pose_time = pose_end_time - pose_start_time
+
+    # 计算总的 GS 生成时间
+    gs_time = encoder_time + pose_time
 
     # 记录渲染的开始时间
     if device.type == 'cuda':
@@ -719,7 +733,9 @@ def evaluate_scene(
         'rendered': rendered_images,
         'gt': gt_images,
         'num_gaussians': num_gaussians,
-        'gs_time': gs_time,  # 生成 GS 的时间（秒）
+        'encoder_time': encoder_time,  # Encoder forward 时间（秒）
+        'pose_time': pose_time,  # Pose prediction 时间（秒）
+        'gs_time': gs_time,  # 生成 GS 的总时间（encoder + pose）
         'render_time': render_time,  # 渲染时间（秒）
         'total_time': gs_time + render_time,  # 总推理时间（秒）
     }
@@ -781,7 +797,8 @@ def main():
     all_results = {}
     summary_metrics = {
         'psnr': [], 'ssim': [], 'lpips': [], 'num_gaussians': [],
-        'gs_time': [], 'render_time': [], 'total_time': []
+        'encoder_time': [], 'pose_time': [], 'gs_time': [],
+        'render_time': [], 'total_time': []
     }
 
     print(f"\n开始评测 {len(eval_indices)} 个场景...")
@@ -815,6 +832,8 @@ def main():
                 'ssim_mean': results['ssim'].mean().item(),
                 'lpips_mean': results['lpips'].mean().item(),
                 'num_gaussians': results['num_gaussians'],
+                'encoder_time': results['encoder_time'],
+                'pose_time': results['pose_time'],
                 'gs_time': results['gs_time'],
                 'render_time': results['render_time'],
                 'total_time': results['total_time'],
@@ -829,6 +848,8 @@ def main():
             summary_metrics['ssim'].append(results['ssim'].mean().item())
             summary_metrics['lpips'].append(results['lpips'].mean().item())
             summary_metrics['num_gaussians'].append(results['num_gaussians'])
+            summary_metrics['encoder_time'].append(results['encoder_time'])
+            summary_metrics['pose_time'].append(results['pose_time'])
             summary_metrics['gs_time'].append(results['gs_time'])
             summary_metrics['render_time'].append(results['render_time'])
             summary_metrics['total_time'].append(results['total_time'])
@@ -879,6 +900,18 @@ def main():
             'min': int(np.min(summary_metrics['num_gaussians'])),
             'max': int(np.max(summary_metrics['num_gaussians'])),
         },
+        'encoder_time': {
+            'mean': np.mean(summary_metrics['encoder_time']),
+            'std': np.std(summary_metrics['encoder_time']),
+            'min': np.min(summary_metrics['encoder_time']),
+            'max': np.max(summary_metrics['encoder_time']),
+        },
+        'pose_time': {
+            'mean': np.mean(summary_metrics['pose_time']),
+            'std': np.std(summary_metrics['pose_time']),
+            'min': np.min(summary_metrics['pose_time']),
+            'max': np.max(summary_metrics['pose_time']),
+        },
         'gs_time': {
             'mean': np.mean(summary_metrics['gs_time']),
             'std': np.std(summary_metrics['gs_time']),
@@ -916,8 +949,12 @@ def main():
     print(f"  Gaussians: {summary['num_gaussians']['mean']:.0f} ± {summary['num_gaussians']['std']:.0f} "
           f"(min: {summary['num_gaussians']['min']}, max: {summary['num_gaussians']['max']})")
     print(f"\n推理时间 (秒):")
+    print(f"  Encoder:  {summary['encoder_time']['mean']:.4f} ± {summary['encoder_time']['std']:.4f} s "
+          f"(min: {summary['encoder_time']['min']:.4f}, max: {summary['encoder_time']['max']:.4f})")
+    print(f"  Pose:     {summary['pose_time']['mean']:.4f} ± {summary['pose_time']['std']:.4f} s "
+          f"(min: {summary['pose_time']['min']:.4f}, max: {summary['pose_time']['max']:.4f})")
     print(f"  生成 GS:  {summary['gs_time']['mean']:.4f} ± {summary['gs_time']['std']:.4f} s "
-          f"(min: {summary['gs_time']['min']:.4f}, max: {summary['gs_time']['max']:.4f})")
+          f"(Encoder + Pose)")
     print(f"  渲染:     {summary['render_time']['mean']:.4f} ± {summary['render_time']['std']:.4f} s "
           f"(min: {summary['render_time']['min']:.4f}, max: {summary['render_time']['max']:.4f})")
     print(f"  总计:     {summary['total_time']['mean']:.4f} ± {summary['total_time']['std']:.4f} s "
