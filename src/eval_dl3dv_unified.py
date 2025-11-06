@@ -538,7 +538,23 @@ def evaluate_scene(
             (h, w)
         )
 
-    # 4. 计算指标
+    # 4. 获取 Gaussian 基元数量
+    # gaussians 通常是一个字典或对象，包含 means, scales, rotations 等
+    # 基元数量可以从任何一个属性的第一个维度获取
+    num_gaussians = 0
+    if hasattr(gaussians, 'means'):
+        # 如果是对象属性
+        num_gaussians = gaussians.means.shape[1] if gaussians.means.ndim > 1 else gaussians.means.shape[0]
+    elif isinstance(gaussians, dict) and 'means' in gaussians:
+        # 如果是字典
+        num_gaussians = gaussians['means'].shape[1] if gaussians['means'].ndim > 1 else gaussians['means'].shape[0]
+    elif hasattr(gaussians, '__len__'):
+        # 如果是 tuple 或 list，通常第一个元素是 means
+        if len(gaussians) > 0:
+            first_elem = gaussians[0]
+            num_gaussians = first_elem.shape[1] if first_elem.ndim > 1 else first_elem.shape[0]
+
+    # 5. 计算指标
     rendered_images = output.color[0]
     gt_images = target_images[0]
 
@@ -552,6 +568,7 @@ def evaluate_scene(
         'lpips': lpips,
         'rendered': rendered_images,
         'gt': gt_images,
+        'num_gaussians': num_gaussians,
     }
 
 
@@ -609,7 +626,7 @@ def main():
 
     # 评测所有场景
     all_results = {}
-    summary_metrics = {'psnr': [], 'ssim': [], 'lpips': []}
+    summary_metrics = {'psnr': [], 'ssim': [], 'lpips': [], 'num_gaussians': []}
 
     print(f"\n开始评测 {len(eval_indices)} 个场景...")
     for scene_hash, indices in tqdm(eval_indices.items(), desc="评测进度"):
@@ -640,6 +657,7 @@ def main():
                 'psnr_mean': results['psnr'].mean().item(),
                 'ssim_mean': results['ssim'].mean().item(),
                 'lpips_mean': results['lpips'].mean().item(),
+                'num_gaussians': results['num_gaussians'],
                 'psnr_per_image': results['psnr'].tolist(),
                 'ssim_per_image': results['ssim'].tolist(),
                 'lpips_per_image': results['lpips'].tolist(),
@@ -650,6 +668,7 @@ def main():
             summary_metrics['psnr'].append(results['psnr'].mean().item())
             summary_metrics['ssim'].append(results['ssim'].mean().item())
             summary_metrics['lpips'].append(results['lpips'].mean().item())
+            summary_metrics['num_gaussians'].append(results['num_gaussians'])
 
             # 保存图像
             if args.save_images:
@@ -691,6 +710,12 @@ def main():
             'min': np.min(summary_metrics['lpips']),
             'max': np.max(summary_metrics['lpips']),
         },
+        'num_gaussians': {
+            'mean': np.mean(summary_metrics['num_gaussians']),
+            'std': np.std(summary_metrics['num_gaussians']),
+            'min': int(np.min(summary_metrics['num_gaussians'])),
+            'max': int(np.max(summary_metrics['num_gaussians'])),
+        },
         'num_scenes': len(summary_metrics['psnr']),
     }
 
@@ -705,6 +730,8 @@ def main():
           f"(min: {summary['ssim']['min']:.4f}, max: {summary['ssim']['max']:.4f})")
     print(f"LPIPS: {summary['lpips']['mean']:.4f} ± {summary['lpips']['std']:.4f} "
           f"(min: {summary['lpips']['min']:.4f}, max: {summary['lpips']['max']:.4f})")
+    print(f"Gaussians: {summary['num_gaussians']['mean']:.0f} ± {summary['num_gaussians']['std']:.0f} "
+          f"(min: {summary['num_gaussians']['min']}, max: {summary['num_gaussians']['max']})")
     print("="*50)
 
     # 保存结果
