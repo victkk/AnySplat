@@ -254,6 +254,12 @@ def setup_args():
         help='仅测试单个场景（用于调试），提供场景哈希'
     )
     parser.add_argument(
+        '--num_scenes',
+        type=int,
+        default=None,
+        help='仅测试前 N 个场景（用于快速验证）。与 --test_single_scene 互斥'
+    )
+    parser.add_argument(
         '--device',
         type=str,
         default='cuda',
@@ -582,6 +588,15 @@ def main():
     if args.test_single_scene:
         eval_indices = {args.test_single_scene: eval_indices[args.test_single_scene]}
         print(f"\n仅测试场景: {args.test_single_scene}")
+    # 如果指定测试前 N 个场景
+    elif args.num_scenes is not None:
+        if args.num_scenes <= 0:
+            raise ValueError(f"--num_scenes 必须是正整数，当前值: {args.num_scenes}")
+
+        # 获取前 N 个场景（保持原有顺序）
+        scene_keys = list(eval_indices.keys())[:args.num_scenes]
+        eval_indices = {k: eval_indices[k] for k in scene_keys}
+        print(f"\n仅测试前 {len(eval_indices)} 个场景（共 {args.num_scenes} 个）")
 
     # 加载模型
     print(f"\n加载 AnySplat 模型...")
